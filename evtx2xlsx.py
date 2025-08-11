@@ -1,303 +1,334 @@
-import pandas as pd
+# -*- coding: utf-8 -*-
 import sys
 import os
 import gc
 import traceback
 import time
 import multiprocessing
+import subprocess
+import importlib.util
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def check_and_install_packages(packages):
+    """检查并安装所需的Python包"""
+    for package, import_name in packages.items():
+        if importlib.util.find_spec(import_name) is None:
+            print(f"正在安装缺失的库: {package}...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", package],
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+                print(f"库 {package} 安装成功。")
+            except subprocess.CalledProcessError as e:
+                print(f"错误: 无法自动安装库 {package}。请手动运行 'pip install {package}'。")
+                print(f"详细错误: {e}")
+                sys.exit(1)
+
+# --- 依赖检查和自动安装 ---
+required_packages = {"pandas": "pandas", "openpyxl": "openpyxl", "python-evtx": "Evtx", "lxml": "lxml"}
+check_and_install_packages(required_packages)
+
+# --- 成功安装依赖后，再导入 ---
+import pandas as pd
+from lxml import etree as ET
 from Evtx.Evtx import Evtx
 from Evtx.Views import evtx_file_xml_view
-import xml.etree.ElementTree as ET
 
-def process_chunk(chunk_data):
-    """处理EVTX数据块，用于并行处理"""
+NS_MAP = {'e': 'http://schemas.microsoft.com/win/2004/08/events/event'}
+LOGON_TYPE_DESC = {
+    '2': 'Interactive (本地登录)', '3': 'Network (网络登录)', '4': 'Batch (批处理)', '5': 'Service (服务)',
+    '7': 'Unlock (解锁)', '8': 'NetworkCleartext (网络明文)', '9': 'NewCredentials (新凭据)',
+    '10': 'RemoteInteractive (远程桌面)', '11': 'CachedInteractive (缓存交互式)'
+}
+
+def process_chunk(chunk_of_xmls):
+    """(多线程)处理EVTX数据块，输入为XML字符串列表"""
     chunk_records = []
-    matched_count = 0
-    
-    for xml, _ in chunk_data:
+    for xml in chunk_of_xmls:
         try:
-            root = ET.fromstring(xml)
-            event_id_element = root.find('.//{http://schemas.microsoft.com/win/2004/08/events/event}EventID')
+            root = ET.fromstring(xml.encode('utf-8'))
+            system_node = root.find('./e:System', namespaces=NS_MAP)
+            if system_node is None: continue
+
+            event_id_element = system_node.find('./e:EventID', namespaces=NS_MAP)
             event_id = event_id_element.text if event_id_element is not None else None
 
-            # 仅筛选登录事件
             if event_id not in ["4624", "4625"]:
                 continue
 
-            matched_count += 1
+            computer_element = system_node.find('./e:Computer', namespaces=NS_MAP)
+            destination_computer = computer_element.text if computer_element is not None else 'N/A'
+            
+            timestamp_element = system_node.find('./e:TimeCreated', namespaces=NS_MAP)
+            timestamp = timestamp_element.attrib.get('SystemTime') if timestamp_element is not None else None
 
-            timestamp_element = root.find('.//{http://schemas.microsoft.com/win/2004/08/events/event}TimeCreated')
-            timestamp = timestamp_element.attrib['SystemTime'] if timestamp_element is not None else None
-
-            # 提取数据元素 - 使用字典优化查找
-            data_elements = {}
-            for data in root.findall('.//{http://schemas.microsoft.com/win/2004/08/events/event}Data'):
-                if 'Name' in data.attrib:
-                    data_elements[data.attrib['Name']] = data.text
+            data_elements = {data.attrib['Name']: data.text for data in root.findall('.//e:Data', namespaces=NS_MAP) if 'Name' in data.attrib}
 
             chunk_records.append({
                 'EventID': event_id,
                 'Timestamp': timestamp,
-                'UserName': data_elements.get('TargetUserName'),
-                'Domain': data_elements.get('TargetDomainName'),
-                'IpAddress': data_elements.get('IpAddress'),
+                'Destination_Computer': destination_computer,
+                'UserName': data_elements.get('TargetUserName', 'N/A'),
+                'Domain': data_elements.get('TargetDomainName', 'N/A'),
+                'IpAddress': data_elements.get('IpAddress', '-'),
+                'Source_Computer': data_elements.get('WorkstationName', '-'),
                 'LogonType': data_elements.get('LogonType')
             })
-        except Exception as e:
-            # 简单记录错误但继续处理
-            pass
-            
-    return chunk_records, matched_count
+        except ET.XMLSyntaxError:
+            continue
+        except Exception:
+            continue
+    return chunk_records
 
 def divide_evtx_into_chunks(evtx_path, num_chunks=None):
-    """将EVTX文件分割成多个块以便并行处理"""
+    """将EVTX文件分割成多个XML字符串块"""
     if num_chunks is None:
-        num_chunks = max(1, multiprocessing.cpu_count() - 1)  # 留一个核心给系统
+        num_chunks = max(1, multiprocessing.cpu_count() - 1)
     
     chunks = [[] for _ in range(num_chunks)]
     chunk_idx = 0
     count = 0
     
+    print("正在准备数据块以便并行处理...")
     with Evtx(evtx_path) as log:
-        for item in evtx_file_xml_view(log):
-            chunks[chunk_idx].append(item)
+        for xml, record in evtx_file_xml_view(log):
+            chunks[chunk_idx].append(xml)
             chunk_idx = (chunk_idx + 1) % num_chunks
             count += 1
-            
-            # 每处理1000条记录输出一次进度
-            if count % 1000 == 0:
-                print(f"正在准备数据块: 已读取 {count} 条记录...")
-    
+            if count % 20000 == 0:
+                print(f"  已读取 {count} 条记录...")
+    print(f"数据块准备完成，共 {count} 条记录被分为 {len(chunks)} 块。")
     return chunks
 
-def save_data_to_excel(records, output_path):
-    """保存数据到Excel文件，优化写入性能"""
+def save_final_report(all_records_df, summary_dfs, output_path):
+    """将所有数据和分析总结保存到同一个Excel文件的不同sheet中"""
+    print(f"开始将结果写入Excel文件: {output_path}")
     try:
-        # 使用更高效的写入方式
-        writer = pd.ExcelWriter(output_path, engine='openpyxl')
-        df = pd.DataFrame(records)
-        df.to_excel(writer, index=False, sheet_name='Login_Events')
-        writer.close()
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            all_records_df.to_excel(writer, index=False, sheet_name='All_Login_Events')
+            print("  - 已写入 'All_Login_Events' sheet.")
+            
+            for sheet_name, df in summary_dfs.items():
+                if sheet_name == 'User_Login_Path_Summary':
+                    df.columns = ['目标计算机', '用户名', '域', '源IP地址', '源计算机名', '成功登录次数', '失败登录次数']
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+                print(f"  - 已写入 '{sheet_name}' sheet.")
+        print("Excel报告生成成功。")
         return True
     except Exception as e:
-        print(f"保存数据时出错: {e}")
+        print(f"保存最终Excel报告时出错: {e}")
         traceback.print_exc()
         return False
 
-def parse_evtx_to_excel(evtx_path, output_excel_path, batch_size=5000, parallel=True):
-    """
-    将EVTX文件解析为Excel文件，支持并行处理和断点续传
-    
-    Args:
-        evtx_path: EVTX文件路径
-        output_excel_path: 输出Excel文件路径
-        batch_size: 每次保存的记录数量
-        parallel: 是否启用并行处理
-    """
-    records = []
-    event_count = 0
-    matched_events = 0
-    last_save_time = time.time()
-    start_time = time.time()
-    temp_file = output_excel_path + ".temp.xlsx"
-    
-    # 检查是否有临时文件，有则加载已处理数据
-    if os.path.exists(temp_file):
-        try:
-            print(f"找到临时文件: {temp_file}，加载已处理数据...")
-            existing_data = pd.read_excel(temp_file)
-            records = existing_data.to_dict('records')
-            matched_events = len(records)
-            print(f"已加载 {matched_events} 条记录，继续处理...")
-        except Exception as e:
-            print(f"加载临时文件失败: {e}")
-            print("将创建新的数据文件...")
+def generate_summary_and_analysis(df_records):
+    """对登录日志进行总结和分析, 生成全新的详细文本报告"""
+    if df_records.empty:
+        return {}, "未找到任何登录事件，无法生成分析报告。"
 
-    print(f"打开EVTX文件: {evtx_path}")
+    print("开始对提取的登录事件进行分析和总结...")
+    df_records['Timestamp'] = pd.to_datetime(df_records['Timestamp'], utc=True, errors='coerce').dt.tz_localize(None)
+    df_records['EventID'] = df_records['EventID'].astype(str)
     
-    # 选择处理模式: 并行或顺序
-    if parallel:
-        print("使用并行处理模式...")
-        try:
-            # 获取可用CPU核心数
-            cpu_cores = max(1, multiprocessing.cpu_count() - 1)  # 保留一个核心给系统
-            print(f"将使用 {cpu_cores} 个CPU核心进行处理")
+    path_summary = df_records.groupby(
+        ['Destination_Computer', 'UserName', 'Domain', 'IpAddress', 'Source_Computer']
+    ).agg(
+        Successful_Logins=('EventID', lambda x: (x == '4624').sum()),
+        Failed_Logins=('EventID', lambda x: (x == '4625').sum())
+    ).reset_index()
+    path_summary = path_summary[(path_summary['Successful_Logins'] > 0) | (path_summary['Failed_Logins'] > 0)]
+    path_summary = path_summary.sort_values(by=['UserName', 'Successful_Logins', 'Failed_Logins'], ascending=[True, False, False])
+
+    user_summary = df_records.groupby(['UserName', 'Domain']).agg(
+        Successful_Logins=('EventID', lambda x: (x == '4624').sum()),
+        Failed_Logins=('EventID', lambda x: (x == '4625').sum())
+    ).reset_index()
+    user_summary['Total_Attempts'] = user_summary['Successful_Logins'] + user_summary['Failed_Logins']
+    user_summary = user_summary.sort_values(by='Total_Attempts', ascending=False)
+
+    ip_summary = df_records[df_records['IpAddress'].notna() & (df_records['IpAddress'] != '-')].groupby('IpAddress').agg(
+        Successful_Logins=('EventID', lambda x: (x == '4624').sum()),
+        Failed_Logins=('EventID', lambda x: (x == '4625').sum()),
+        Affected_Users=('UserName', lambda x: ', '.join(x.unique()))
+    ).reset_index()
+    ip_summary['Total_Attempts'] = ip_summary['Successful_Logins'] + ip_summary['Failed_Logins']
+    ip_summary = ip_summary.sort_values(by='Total_Attempts', ascending=False)
+    
+    df_records['LogonType_Desc'] = df_records['LogonType'].map(LOGON_TYPE_DESC).fillna('Unknown')
+    logon_type_summary = df_records.groupby(['LogonType', 'LogonType_Desc']).agg(
+        Count=('EventID', 'count')
+    ).reset_index().sort_values(by='Count', ascending=False)
+    
+    # --- 全新的文本报告生成逻辑 ---
+    summary_text = []
+    summary_text.append("=" * 60)
+    summary_text.append("          Windows 登录日志审计分析报告")
+    summary_text.append("=" * 60)
+    summary_text.append("\n--- 1. 总体情况概览 ---")
+    summary_text.append(f"  - 分析时间范围: {df_records['Timestamp'].min(skipna=True).strftime('%Y-%m-%d %H:%M:%S')} to {df_records['Timestamp'].max(skipna=True).strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_text.append(f"  - 总共分析登录事件数: {len(df_records)} (成功: {(df_records['EventID'] == '4624').sum()}, 失败: {(df_records['EventID'] == '4625').sum()})")
+    summary_text.append(f"  - 涉及独立用户账户数 (含机器账户): {df_records['UserName'].nunique()}")
+    summary_text.append(f"  - 涉及源IP数: {df_records[df_records['IpAddress'] != '-']['IpAddress'].nunique()}")
+    summary_text.append(f"  - 涉及目标计算机数: {df_records['Destination_Computer'].nunique()}")
+    
+    summary_text.append("\n\n--- 2. 详细用户登录活动报告 (已排除机器账户) ---")
+    
+    # 过滤掉机器账户 (以 $ 结尾)
+    human_user_paths = path_summary[~path_summary['UserName'].str.endswith('$', na=False)]
+
+    if human_user_paths.empty:
+        summary_text.append("\n未发现任何人类用户的登录活动。")
+    else:
+        # 按用户名和域分组，为每个用户生成一份详细报告
+        for (username, domain), user_activities in human_user_paths.groupby(['UserName', 'Domain']):
+            summary_text.append("\n" + "=" * 60)
+            summary_text.append(f"用户: {username}  (域: {domain})")
+            summary_text.append("-" * 60)
             
-            # 分割数据
-            print("分割数据为多个块...")
+            total_success = user_activities['Successful_Logins'].sum()
+            total_failed = user_activities['Failed_Logins'].sum()
+            summary_text.append(f"  [用户活动总计: 成功 {total_success} 次, 失败 {total_failed} 次]")
+
+            # 在每个用户下，按目标计算机再次分组
+            for dest_computer, dest_activities in user_activities.groupby('Destination_Computer'):
+                summary_text.append(f"\n  -> 登录到目标计算机: {dest_computer}")
+                
+                # 遍历该用户到该目标计算机的所有登录路径
+                for _, row in dest_activities.iterrows():
+                    source_ip = row['IpAddress']
+                    source_computer = row['Source_Computer']
+                    success_count = row['Successful_Logins']
+                    failed_count = row['Failed_Logins']
+                    
+                    report_line = f"    - 从 [源IP: {source_ip:<15} | 源计算机: {source_computer}]"
+                    report_line += f"  >>  成功: {success_count} 次, 失败: {failed_count} 次"
+                    summary_text.append(report_line)
+
+    summary_text.append("\n\n" + "=" * 60)
+    summary_text.append("报告结束。详细聚合数据请查看Excel文件。")
+    
+    print("分析总结完成。")
+
+    summary_dfs = {
+        'User_Login_Path_Summary': path_summary,
+        'User_Summary': user_summary,
+        'IP_Summary': ip_summary,
+        'LogonType_Summary': logon_type_summary
+    }
+    return summary_dfs, "\n".join(summary_text)
+
+
+def parse_evtx_to_excel(evtx_path, output_excel_path, batch_size=10000, parallel=True):
+    records = []
+    start_time = time.time()
+    
+    print(f"正在打开EVTX文件: {evtx_path}")
+    
+    if parallel:
+        print("模式: 并行处理。")
+        try:
+            cpu_cores = max(1, multiprocessing.cpu_count() - 1)
+            print(f"将使用 {cpu_cores} 个CPU核心进行处理。")
+            
             chunks = divide_evtx_into_chunks(evtx_path, cpu_cores)
             total_chunks = len(chunks)
-            print(f"数据已分割为 {total_chunks} 个块")
+            processed_chunks = 0
             
-            # 并行处理各个块
-            print("开始并行处理...")
             with ProcessPoolExecutor(max_workers=cpu_cores) as executor:
                 futures = {executor.submit(process_chunk, chunk): i for i, chunk in enumerate(chunks)}
-                
-                completed = 0
                 for future in as_completed(futures):
-                    chunk_idx = futures[future]
+                    processed_chunks += 1
                     try:
-                        chunk_records, chunk_matched = future.result()
+                        chunk_records = future.result()
                         records.extend(chunk_records)
-                        matched_events += chunk_matched
-                        event_count += len(chunks[chunk_idx])
-                        
-                        completed += 1
-                        progress = (completed / total_chunks) * 100
-                        print(f"进度: {progress:.2f}% | 已完成 {completed}/{total_chunks} 个数据块 | 匹配: {matched_events} 登录事件")
-                        
-                        # 定期保存
-                        if matched_events % batch_size == 0 or time.time() - last_save_time > 300:
-                            print(f"临时保存数据到 {temp_file}...")
-                            save_data_to_excel(records, temp_file)
-                            last_save_time = time.time()
-                            
-                            # 释放内存
-                            gc.collect()
-                    
+                        progress = (processed_chunks / total_chunks) * 100
+                        print(f"进度: {progress:.2f}% | 完成 {processed_chunks}/{total_chunks} 个数据块 | 当前匹配总数: {len(records)}")
                     except Exception as e:
-                        print(f"处理数据块 {chunk_idx} 时出错: {e}")
-                        traceback.print_exc()
-        
-        except Exception as e:
-            print(f"并行处理出错: {e}")
-            traceback.print_exc()
-            print("切换到顺序处理模式...")
+                        print(f"处理一个数据块时发生意外错误: {e}")
             
-            # 如果并行处理失败，回退到顺序处理
+        except Exception as e:
+            print(f"并行处理过程中发生严重错误: {e}")
+            traceback.print_exc()
+            print("将自动切换到更稳定的顺序处理模式...")
             return parse_evtx_to_excel(evtx_path, output_excel_path, batch_size, parallel=False)
     
-    else:
-        # 顺序处理模式
-        print("使用顺序处理模式...")
+    if not parallel:
+        print("模式: 顺序处理。")
         try:
-            # 优化XML解析速度的缓存
-            ns_map = {
-                'e': 'http://schemas.microsoft.com/win/2004/08/events/event'
-            }
-            
             with Evtx(evtx_path) as log:
-                # 获取文件总大小用于进度显示
-                total_size = os.path.getsize(evtx_path)
-                
+                total_event_count = 0
                 for xml, record in evtx_file_xml_view(log):
+                    total_event_count += 1
+                    if total_event_count % 10000 == 0:
+                        print(f"进度: 已处理 {total_event_count} 事件 | 当前匹配总数: {len(records)}")
+                    
                     try:
-                        event_count += 1
-                        
-                        # 更新进度显示
-                        if event_count % 500 == 0:
-                            try:
-                                # 调用offset()方法获取当前位置
-                                current_position = record.offset() if callable(record.offset) else record.offset
-                            except:
-                                # 如果获取失败，使用估算值
-                                current_position = (event_count / (event_count + 1)) * total_size
-                                
-                            elapsed = time.time() - start_time
-                            progress = (current_position / total_size) * 100 if total_size > 0 else 0
-                            events_per_sec = event_count / elapsed if elapsed > 0 else 0
-                            
-                            print(f"进度: {progress:.2f}% | "
-                                f"已处理: {event_count} 事件 | 匹配: {matched_events} 登录事件 | "
-                                f"速度: {events_per_sec:.2f} 事件/秒")
-                        
-                        # 使用缓存的命名空间优化查找速度
-                        root = ET.fromstring(xml)
-                        event_id_element = root.find('.//e:EventID', ns_map)
+                        root = ET.fromstring(xml.encode('utf-8'))
+                        system_node = root.find('./e:System', namespaces=NS_MAP)
+                        if system_node is None: continue
+
+                        event_id_element = system_node.find('./e:EventID', namespaces=NS_MAP)
                         event_id = event_id_element.text if event_id_element is not None else None
 
-                        # 仅筛选登录事件
-                        if event_id not in ["4624", "4625"]:
-                            continue
+                        if event_id not in ["4624", "4625"]: continue
 
-                        matched_events += 1
+                        computer_element = system_node.find('./e:Computer', namespaces=NS_MAP)
+                        destination_computer = computer_element.text if computer_element is not None else 'N/A'
 
-                        timestamp_element = root.find('.//e:TimeCreated', ns_map)
-                        timestamp = timestamp_element.attrib['SystemTime'] if timestamp_element is not None else None
+                        timestamp_element = system_node.find('./e:TimeCreated', namespaces=NS_MAP)
+                        timestamp = timestamp_element.attrib.get('SystemTime') if timestamp_element is not None else None
 
-                        # 提取数据元素 - 只查找一次所有Data元素并存入字典
-                        data_elements = {}
-                        for data in root.findall('.//e:Data', ns_map):
-                            if 'Name' in data.attrib:
-                                data_elements[data.attrib['Name']] = data.text
+                        data_elements = {data.attrib['Name']: data.text for data in root.findall('.//e:Data', namespaces=NS_MAP) if 'Name' in data.attrib}
 
                         records.append({
-                            'EventID': event_id,
-                            'Timestamp': timestamp,
-                            'UserName': data_elements.get('TargetUserName'),
-                            'Domain': data_elements.get('TargetDomainName'),
-                            'IpAddress': data_elements.get('IpAddress'),
+                            'EventID': event_id, 'Timestamp': timestamp, 'Destination_Computer': destination_computer,
+                            'UserName': data_elements.get('TargetUserName', 'N/A'), 'Domain': data_elements.get('TargetDomainName', 'N/A'),
+                            'IpAddress': data_elements.get('IpAddress', '-'), 'Source_Computer': data_elements.get('WorkstationName', '-'),
                             'LogonType': data_elements.get('LogonType')
                         })
-
-                        # 定期保存数据到临时文件
-                        current_time = time.time()
-                        if (matched_events % batch_size == 0) or (current_time - last_save_time > 300):  # 每batch_size条或5分钟保存一次
-                            save_data_to_excel(records, temp_file)
-                            last_save_time = current_time
-                            print(f"临时保存数据到 {temp_file}，已处理 {matched_events} 条登录事件")
-                            
-                            # 释放内存
-                            gc.collect()
-                    
-                    except Exception as e:
-                        print(f"处理事件时出错: {e}")
-                        if event_count % 1000 == 0:  # 避免过多错误信息
-                            traceback.print_exc()
-                        print("继续处理下一条事件...")
+                    except ET.XMLSyntaxError:
                         continue
-        
         except Exception as e:
-            print(f"处理EVTX文件时出错: {e}")
+            print(f"顺序处理EVTX文件时发生严重错误: {e}")
             traceback.print_exc()
     
-    # 最终保存所有数据
     if records:
-        print(f"完成处理，匹配到 {matched_events} 条登录事件")
-        print(f"保存数据到 {output_excel_path}...")
+        print(f"\n处理完成，共匹配到 {len(records)} 条登录事件。")
+        df_records = pd.DataFrame(records)
+        summary_dfs, summary_text = generate_summary_and_analysis(df_records)
         
-        try:
-            save_data_to_excel(records, output_excel_path)
-            print(f"数据已保存到 {output_excel_path}")
-            
-            # 处理成功后删除临时文件
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                print(f"已删除临时文件 {temp_file}")
-        except Exception as e:
-            print(f"保存最终数据时出错: {e}")
-            traceback.print_exc()
-            print(f"请检查临时文件 {temp_file} 是否包含已处理数据")
+        if save_final_report(df_records, summary_dfs, output_excel_path):
+            summary_txt_path = os.path.splitext(output_excel_path)[0] + "_summary.txt"
+            try:
+                with open(summary_txt_path, 'w', encoding='utf-8') as f:
+                    f.write(summary_text)
+                print(f"分析总结报告已保存到: {summary_txt_path}")
+            except Exception as e:
+                print(f"保存文本总结报告时出错: {e}")
     else:
-        print("未找到匹配的登录事件")
+        print("未在日志文件中找到任何匹配的登录事件(ID 4624 或 4625)。")
 
-    # 显示处理时间和性能统计
-    total_time = time.time() - start_time
-    print(f"总处理时间: {total_time:.2f} 秒")
-    if event_count > 0:
-        print(f"平均处理速度: {event_count/total_time:.2f} 事件/秒")
-    if matched_events > 0:
-        print(f"匹配事件比例: {(matched_events/event_count)*100:.2f}%")
+    print(f"\n总处理时间: {time.time() - start_time:.2f} 秒")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("用法: python3 evtx2xlsx.py 输入文件.evtx 输出文件.xlsx [--sequential]")
-        print("选项:")
-        print("  --sequential  禁用并行处理，使用单线程顺序处理模式")
+        print("\n用法: python evtx2xlsx.py <输入文件.evtx> <输出文件.xlsx> [--sequential]")
         sys.exit(1)
 
     evtx_path = sys.argv[1]
     output_excel_path = sys.argv[2]
-    
-    # 检查是否使用顺序处理模式
     use_parallel = "--sequential" not in sys.argv
     
-    print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"处理模式: {'并行' if use_parallel else '顺序'}")
-    
+    # 删除可能存在的旧的、格式不兼容的临时文件
+    temp_file = output_excel_path + ".temp.xlsx"
+    if os.path.exists(temp_file):
+        print(f"警告: 发现旧的临时文件 {temp_file}，将予以删除以保证数据一致性。")
+        try:
+            os.remove(temp_file)
+        except OSError as e:
+            print(f"删除临时文件失败: {e}，请手动删除后重试。")
+            sys.exit(1)
+            
+    print("="*50 + f"\n任务启动: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     parse_evtx_to_excel(evtx_path, output_excel_path, parallel=use_parallel)
-    
-    print(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("\n" + "="*50 + f"\n任务结束: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" + "="*50)
